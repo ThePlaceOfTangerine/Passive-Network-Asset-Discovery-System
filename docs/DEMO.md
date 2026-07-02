@@ -41,7 +41,7 @@ Expected output:
 ## 2. Build C++ Collector
 
 ~~~bash
-cd collector-cpp
+cd collector
 cmake -S . -B build
 cmake --build build
 ~~~
@@ -99,7 +99,7 @@ samples/arp-demo.pcap
 Run collector in PCAP mode:
 
 ~~~bash
-cd collector-cpp
+cd collector
 ./build/asset_collector --mode pcap --file ../samples/arp-demo.pcap
 ~~~
 

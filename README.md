@@ -40,7 +40,7 @@ passive-asset-discovery/
 │       └── models.py
 ├── clickhouse/
 │   └── init.sql
-├── collector-cpp/
+├── collector/
 │   ├── include/
 │   └── src/
 ├── docs/
@@ -66,7 +66,7 @@ curl http://localhost:8000/health
 Build C++ collector:
 
 ~~~bash
-cd collector-cpp
+cd collector
 cmake -S . -B build
 cmake --build build
 ~~~

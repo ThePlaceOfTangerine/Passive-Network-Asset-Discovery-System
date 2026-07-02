@@ -1,5 +1,5 @@
 # C++ build
-collector-cpp/build/
+collector/build/
 build/
 *.o
 *.so
