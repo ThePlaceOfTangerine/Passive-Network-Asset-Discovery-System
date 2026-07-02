@@ -1,0 +1,33 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: asset-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: assetdb
+      CLICKHOUSE_USER: asset_user
+      CLICKHOUSE_PASSWORD: asset_pass
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - asset_clickhouse_data:/var/lib/clickhouse
+
+  api:
+    build:
+      context: ./api
+    container_name: asset-api
+    ports:
+      - "8000:8000"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DATABASE: assetdb
+      CLICKHOUSE_USER: asset_user
+      CLICKHOUSE_PASSWORD: asset_pass
+    depends_on:
+      - clickhouse
+
+volumes:
+  asset_clickhouse_data:

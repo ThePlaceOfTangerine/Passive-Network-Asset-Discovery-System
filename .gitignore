@@ -1,0 +1,24 @@
+# C++ build
+collector-cpp/build/
+build/
+*.o
+*.so
+*.a
+*.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+
+# Logs / local data
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
