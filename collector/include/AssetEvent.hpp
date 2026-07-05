@@ -11,7 +11,6 @@ struct AssetEvent {
     std::string hostname;
     std::string vendor;
     std::string source;
-    double confidence;
     std::string first_seen;
     std::string last_seen;
     nlohmann::json raw;
@@ -25,7 +24,6 @@ struct AssetEvent {
             {"hostname", hostname},
             {"vendor", vendor},
             {"source", source},
-            {"confidence", confidence},
             {"first_seen", first_seen},
             {"last_seen", last_seen},
             {"raw", raw}

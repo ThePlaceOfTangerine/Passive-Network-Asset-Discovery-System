@@ -35,3 +35,18 @@ CREATE TABLE IF NOT EXISTS assetdb.assets_latest
 )
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY asset_id;
+
+CREATE TABLE IF NOT EXISTS asset_alerts
+(
+    alert_id String,
+    alert_type LowCardinality(String),
+    severity LowCardinality(String),
+    asset_id String,
+    ip String,
+    mac String,
+    source LowCardinality(String),
+    message String,
+    created_at DateTime
+)
+ENGINE = MergeTree
+ORDER BY (created_at, alert_type, asset_id);

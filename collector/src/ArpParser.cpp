@@ -67,7 +67,6 @@ std::optional<AssetEvent> ArpParser::parse(const uint8_t* packet, int length, co
     event.hostname = "";
     event.vendor = "";
     event.source = "arp";
-    event.confidence = 0.9;
     event.first_seen = timestamp;
     event.last_seen = timestamp;
     event.raw = {

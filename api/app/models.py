@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class AssetEvent(BaseModel):
@@ -12,7 +12,6 @@ class AssetEvent(BaseModel):
     hostname: str = ""
     vendor: str = ""
     source: str
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     first_seen: datetime
     last_seen: datetime
     raw: Dict[str, Any] = {}
