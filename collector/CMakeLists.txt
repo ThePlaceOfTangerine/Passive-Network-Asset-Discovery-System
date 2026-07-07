@@ -12,6 +12,7 @@ add_executable(asset_collector
     src/HttpClient.cpp
     src/ArpParser.cpp
     src/DhcpParser.cpp
+    src/SsdpParser.cpp
 )
 
 target_include_directories(asset_collector PRIVATE include)

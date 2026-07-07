@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS assetdb.assets_latest
     mac String,
     hostname String,
     vendor String,
+    device_type String DEFAULT '',
+    model_hint String DEFAULT '',
+    os_hint String DEFAULT '',
+    service_hints Array(String) DEFAULT [],
     sources Array(String),
     confidence Float32,
     first_seen DateTime,
@@ -50,3 +54,13 @@ CREATE TABLE IF NOT EXISTS asset_alerts
 )
 ENGINE = MergeTree
 ORDER BY (created_at, alert_type, asset_id);
+
+CREATE TABLE IF NOT EXISTS mac_vendor_cache
+(
+    prefix String,
+    vendor String,
+    source LowCardinality(String),
+    last_checked DateTime
+)
+ENGINE = ReplacingMergeTree(last_checked)
+ORDER BY prefix;

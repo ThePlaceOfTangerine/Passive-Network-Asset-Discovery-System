@@ -1,5 +1,7 @@
 import json
 import uuid
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -160,6 +162,10 @@ def get_existing_asset(asset_id: str) -> Optional[dict]:
         mac,
         hostname,
         vendor,
+        device_type,
+        model_hint,
+        os_hint,
+        service_hints,
         sources,
         first_seen,
         last_seen,
@@ -273,6 +279,228 @@ def asset_resurfaced_alert(
     }
 
 
+
+VENDOR_MEMORY_CACHE = {}
+
+
+def normalize_oui_prefix(mac: str) -> str:
+    hex_chars = "".join(ch for ch in str(mac).upper() if ch in "0123456789ABCDEF")
+
+    if len(hex_chars) < 6:
+        return ""
+
+    return f"{hex_chars[0:2]}:{hex_chars[2:4]}:{hex_chars[4:6]}"
+
+
+def is_local_or_random_mac(mac: str) -> bool:
+    hex_chars = "".join(ch for ch in str(mac).upper() if ch in "0123456789ABCDEF")
+
+    if len(hex_chars) < 2:
+        return False
+
+    first_byte = int(hex_chars[0:2], 16)
+
+    return bool(first_byte & 0x02)
+
+
+def get_vendor_from_cache(prefix: str) -> str:
+    if not prefix:
+        return ""
+
+    if prefix in VENDOR_MEMORY_CACHE:
+        return VENDOR_MEMORY_CACHE[prefix]
+
+    safe_prefix = sql_escape(prefix)
+
+    query = f"""
+    SELECT vendor
+    FROM mac_vendor_cache FINAL
+    WHERE prefix = '{safe_prefix}'
+    ORDER BY last_checked DESC
+    LIMIT 1
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    lines = [line for line in result.strip().splitlines() if line]
+
+    if not lines:
+        return ""
+
+    row = json.loads(lines[0])
+    vendor = row.get("vendor", "")
+
+    if vendor:
+        VENDOR_MEMORY_CACHE[prefix] = vendor
+
+    return vendor
+
+
+def save_vendor_cache(prefix: str, vendor: str, source: str):
+    if not prefix or not vendor:
+        return
+
+    VENDOR_MEMORY_CACHE[prefix] = vendor
+
+    ch_insert_json(
+        "mac_vendor_cache",
+        [
+            {
+                "prefix": prefix,
+                "vendor": vendor,
+                "source": source,
+                "last_checked": now_string(),
+            }
+        ],
+    )
+
+
+def lookup_vendor_online(mac: str) -> str:
+    try:
+        encoded_mac = urllib.parse.quote(str(mac), safe="")
+        url = f"https://api.maclookup.app/v2/macs/{encoded_mac}/company/name"
+
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "PassiveAssetDiscovery/1.0"},
+        )
+
+        with urllib.request.urlopen(request, timeout=2) as response:
+            vendor = response.read().decode("utf-8", errors="ignore").strip()
+
+        if not vendor:
+            return ""
+
+        if vendor.startswith("*NO COMPANY*"):
+            return ""
+
+        if vendor.startswith("*PRIVATE*"):
+            return "Private Vendor"
+
+        if "Too Many Requests" in vendor:
+            return ""
+
+        if "MAC must be greater" in vendor:
+            return ""
+
+        return vendor[:200]
+
+    except Exception:
+        return ""
+
+
+def lookup_vendor(mac: str) -> str:
+    prefix = normalize_oui_prefix(mac)
+
+    if not prefix:
+        return "Unknown"
+
+    cached_vendor = get_vendor_from_cache(prefix)
+    if cached_vendor:
+        return cached_vendor
+
+    if is_local_or_random_mac(mac):
+        vendor = "Private/Randomized MAC"
+        save_vendor_cache(prefix, vendor, "local_rule")
+        return vendor
+
+    online_vendor = lookup_vendor_online(mac)
+
+    if online_vendor:
+        save_vendor_cache(prefix, online_vendor, "maclookup.app")
+        return online_vendor
+
+    return "Unknown"
+
+
+
+def merge_unique_list(existing, new_items):
+    result = []
+
+    if isinstance(existing, list):
+        result.extend(existing)
+
+    for item in new_items:
+        if item and item not in result:
+            result.append(item)
+
+    return result
+
+
+def extract_ssdp_fingerprint(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        return {
+            "device_type": "",
+            "model_hint": "",
+            "os_hint": "",
+            "service_hints": [],
+        }
+
+    protocol = str(raw.get("protocol", "")).lower()
+    if protocol != "ssdp":
+        return {
+            "device_type": "",
+            "model_hint": "",
+            "os_hint": "",
+            "service_hints": [],
+        }
+
+    server = str(raw.get("server", ""))
+    st = str(raw.get("st", ""))
+    nt = str(raw.get("nt", ""))
+    usn = str(raw.get("usn", ""))
+    location = str(raw.get("location", ""))
+
+    combined = " ".join([server, st, nt, usn, location]).lower()
+
+    service_hints = ["ssdp", "upnp"]
+    device_type = ""
+    model_hint = ""
+    os_hint = ""
+
+    if "internetgatewaydevice" in combined or "igd.xml" in combined:
+        device_type = "router"
+        service_hints.append("internet_gateway")
+    elif "printer" in combined:
+        device_type = "printer"
+        service_hints.append("printer")
+    elif "camera" in combined:
+        device_type = "camera"
+        service_hints.append("camera")
+    elif "mediarenderer" in combined or "dlna" in combined:
+        device_type = "media_device"
+        service_hints.append("media_renderer")
+    elif "rootdevice" in combined:
+        device_type = "upnp_device"
+
+    if server:
+        parts = server.split()
+
+        if parts:
+            os_hint = parts[0]
+
+        for part in reversed(parts):
+            upper = part.upper()
+            if (
+                "/" in part
+                and "UPNP" not in upper
+                and not upper.startswith("HTTP")
+                and not upper.startswith("TPOS")
+            ):
+                model_hint = part
+                break
+
+        if not model_hint:
+            model_hint = server
+
+    return {
+        "device_type": device_type,
+        "model_hint": model_hint,
+        "os_hint": os_hint,
+        "service_hints": service_hints,
+    }
+
+
 def upsert_assets(events: List[AssetEvent]):
     grouped = {}
 
@@ -288,6 +516,10 @@ def upsert_assets(events: List[AssetEvent]):
         existing_ip = existing.get("ip", "") if existing else ""
         existing_hostname = existing.get("hostname", "") if existing else ""
         existing_vendor = existing.get("vendor", "") if existing else ""
+        existing_device_type = existing.get("device_type", "") if existing else ""
+        existing_model_hint = existing.get("model_hint", "") if existing else ""
+        existing_os_hint = existing.get("os_hint", "") if existing else ""
+        existing_service_hints = existing.get("service_hints", []) if existing else []
         existing_sources = existing.get("sources", []) if existing else []
         existing_first_seen = existing.get("first_seen") if existing else None
         existing_last_seen = existing.get("last_seen", "") if existing else ""
@@ -295,6 +527,10 @@ def upsert_assets(events: List[AssetEvent]):
         final_ip = existing_ip
         final_hostname = existing_hostname
         final_vendor = existing_vendor
+        final_device_type = existing_device_type
+        final_model_hint = existing_model_hint
+        final_os_hint = existing_os_hint
+        final_service_hints = list(existing_service_hints)
         final_sources = list(existing_sources)
         final_last_seen = None
         final_last_source = ""
@@ -320,12 +556,28 @@ def upsert_assets(events: List[AssetEvent]):
             if event.hostname:
                 final_hostname = event.hostname
 
-            if event.vendor:
+            if event.vendor and event.vendor != "Unknown":
                 final_vendor = event.vendor
 
             final_sources = merge_sources(final_sources, event.source)
 
-        if not final_vendor:
+            fingerprint = extract_ssdp_fingerprint(event.raw)
+
+            if fingerprint.get("device_type"):
+                final_device_type = fingerprint["device_type"]
+
+            if fingerprint.get("model_hint"):
+                final_model_hint = fingerprint["model_hint"]
+
+            if fingerprint.get("os_hint"):
+                final_os_hint = fingerprint["os_hint"]
+
+            final_service_hints = merge_unique_list(
+                final_service_hints,
+                fingerprint.get("service_hints", []),
+            )
+
+        if not final_vendor or final_vendor == "Unknown":
             final_vendor = lookup_vendor(asset_events[-1].mac)
 
         if first_seen_candidates:
@@ -342,6 +594,10 @@ def upsert_assets(events: List[AssetEvent]):
                 "mac": mac,
                 "hostname": final_hostname,
                 "vendor": final_vendor,
+                "device_type": final_device_type,
+                "model_hint": final_model_hint,
+                "os_hint": final_os_hint,
+                "service_hints": final_service_hints,
                 "sources": final_sources,
                 "first_seen": final_first_seen,
                 "last_seen": format_datetime(final_last_seen),
@@ -433,6 +689,41 @@ def list_alerts(
     return {"total": len(rows), "items": rows}
 
 
+
+@app.get("/api/v1/vendors")
+def list_vendor_cache(
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    query = f"""
+    SELECT
+        prefix,
+        vendor,
+        source,
+        last_checked
+    FROM mac_vendor_cache FINAL
+    ORDER BY last_checked DESC
+    LIMIT {limit}
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    rows = [json.loads(line) for line in result.strip().splitlines() if line]
+
+    return {"total": len(rows), "items": rows}
+
+
+@app.get("/api/v1/vendors/lookup")
+def lookup_vendor_api(mac: str):
+    prefix = normalize_oui_prefix(mac)
+    vendor = lookup_vendor(mac)
+
+    return {
+        "mac": mac,
+        "prefix": prefix,
+        "vendor": vendor,
+    }
+
+
 @app.get("/api/v1/assets")
 def list_assets(
     ip: Optional[str] = None,
@@ -460,6 +751,10 @@ def list_assets(
         mac,
         hostname,
         vendor,
+        device_type,
+        model_hint,
+        os_hint,
+        service_hints,
         sources,
         first_seen,
         last_seen,

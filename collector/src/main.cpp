@@ -14,6 +14,7 @@
 #include "DhcpParser.hpp"
 #include "HttpClient.hpp"
 #include "ProtocolParser.hpp"
+#include "SsdpParser.hpp"
 
 static bool running = true;
 
@@ -146,6 +147,7 @@ CollectorStats processPackets(
     std::vector<std::unique_ptr<ProtocolParser>> parsers;
     parsers.push_back(std::make_unique<ArpParser>());
     parsers.push_back(std::make_unique<DhcpParser>());
+    parsers.push_back(std::make_unique<SsdpParser>());
 
     HttpClient client(url);
 
@@ -248,7 +250,7 @@ int main(int argc, char** argv) {
         std::cout << "Loaded config: " << configPath << "\n";
     }
 
-    std::string defaultFilter = "arp or (udp and (port 67 or port 68))";
+    std::string defaultFilter = "arp or (udp and (port 67 or port 68)) or udp port 1900";
 
     std::string mode = getArg(argc, argv, "--mode", configValue(config, "mode", "live"));
     std::string iface = getArg(argc, argv, "--iface", configValue(config, "interface", ""));
