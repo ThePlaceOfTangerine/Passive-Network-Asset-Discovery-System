@@ -7,6 +7,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "ArpParser.hpp"
 #include "DhcpParser.hpp"
@@ -116,6 +117,7 @@ void printUsage() {
         << "  --config <file>    Load collector settings from config file.\n"
         << "  --url <endpoint>   Default: http://localhost:8000/api/v1/ingest/asset-events\n"
         << "  --count <n>        Stop after n discovered asset events. 0 means unlimited in live mode.\n"
+        << "  --batch-size <n>   Number of asset events per HTTP request. Default: 5.\n"
         << "  --filter <value>   Default: arp or DHCP. Use 'all' to disable BPF filter.\n\n"
         << "Examples:\n"
         << "  sudo ./asset_collector --config ../config/collector.conf --count 5\n"
@@ -136,13 +138,39 @@ CollectorStats processPackets(
     pcap_t* handle,
     const std::string& sourceName,
     const std::string& url,
-    int countLimit
+    int countLimit,
+    int batchSize
 ) {
     ArpParser arpParser;
     DhcpParser dhcpParser;
     HttpClient client(url);
 
     CollectorStats stats;
+    std::vector<AssetEvent> batch;
+
+    auto flushBatch = [&]() {
+        if (batch.empty()) {
+            return;
+        }
+
+        try {
+            size_t eventCount = batch.size();
+            bool ok = client.postEvents(batch);
+
+            if (ok) {
+                stats.sent_events += static_cast<int>(eventCount);
+                std::cout << "Flushed batch with " << eventCount << " asset event(s)\n";
+            } else {
+                stats.failed_sends += static_cast<int>(eventCount);
+                std::cerr << "Failed to post batch with " << eventCount << " asset event(s)\n";
+            }
+        } catch (const std::exception& exc) {
+            stats.failed_sends += static_cast<int>(batch.size());
+            std::cerr << "Failed to post asset event batch: " << exc.what() << "\n";
+        }
+
+        batch.clear();
+    };
 
     while (running) {
         struct pcap_pkthdr* header = nullptr;
@@ -188,18 +216,18 @@ CollectorStats processPackets(
 
         std::cout << "\n";
 
-        try {
-            client.postEvents({event.value()});
-            stats.sent_events++;
-        } catch (const std::exception& exc) {
-            stats.failed_sends++;
-            std::cerr << "Failed to post asset event: " << exc.what() << "\n";
+        batch.push_back(event.value());
+
+        if (static_cast<int>(batch.size()) >= batchSize) {
+            flushBatch();
         }
 
         if (countLimit > 0 && stats.parsed_asset_events >= countLimit) {
             break;
         }
     }
+
+    flushBatch();
 
     return stats;
 }
@@ -227,7 +255,19 @@ int main(int argc, char** argv) {
         configuredCount = 0;
     }
 
+    int configuredBatchSize = 5;
+    try {
+        configuredBatchSize = std::stoi(configValue(config, "batch_size", "5"));
+    } catch (...) {
+        configuredBatchSize = 5;
+    }
+
     int countLimit = getIntArg(argc, argv, "--count", configuredCount);
+    int batchSize = getIntArg(argc, argv, "--batch-size", configuredBatchSize);
+
+    if (batchSize <= 0) {
+        batchSize = 1;
+    }
 
     std::signal(SIGINT, handleSignal);
 
@@ -321,7 +361,9 @@ int main(int argc, char** argv) {
         std::cout << "Run mode: stop after " << countLimit << " asset event(s)\n";
     }
 
-    CollectorStats stats = processPackets(handle, sourceName, url, countLimit);
+    std::cout << "Batch size: " << batchSize << "\n";
+
+    CollectorStats stats = processPackets(handle, sourceName, url, countLimit, batchSize);
 
     if (filterInstalled) {
         pcap_freecode(&fp);
