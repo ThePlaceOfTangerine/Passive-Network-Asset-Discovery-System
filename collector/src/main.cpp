@@ -7,6 +7,10 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -139,6 +143,112 @@ void printSummary(const CollectorStats& stats) {
               << "- Failed sends: " << stats.failed_sends << "\n";
 }
 
+
+class AsyncBatchSender {
+public:
+    explicit AsyncBatchSender(const std::string& endpoint)
+        : client_(endpoint),
+          worker_(&AsyncBatchSender::run, this) {}
+
+    ~AsyncBatchSender() {
+        stop();
+    }
+
+    void enqueue(std::vector<AssetEvent> events) {
+        if (events.empty()) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push(std::move(events));
+        }
+
+        cv_.notify_one();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (stopping_) {
+                // stop() may be called manually and again by destructor
+            }
+
+            stopping_ = true;
+        }
+
+        cv_.notify_one();
+
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    int sentEvents() const {
+        return sent_events_;
+    }
+
+    int failedEvents() const {
+        return failed_events_;
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::vector<AssetEvent> batch;
+
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+
+                cv_.wait(lock, [&]() {
+                    return stopping_ || !queue_.empty();
+                });
+
+                if (queue_.empty() && stopping_) {
+                    break;
+                }
+
+                batch = std::move(queue_.front());
+                queue_.pop();
+            }
+
+            size_t eventCount = batch.size();
+
+            try {
+                bool ok = client_.postEvents(batch);
+
+                if (ok) {
+                    sent_events_ += static_cast<int>(eventCount);
+                    std::cout << "Sender thread posted "
+                              << eventCount
+                              << " asset event(s)\n";
+                } else {
+                    failed_events_ += static_cast<int>(eventCount);
+                    std::cerr << "Sender thread failed to post "
+                              << eventCount
+                              << " asset event(s)\n";
+                }
+            } catch (const std::exception& exc) {
+                failed_events_ += static_cast<int>(eventCount);
+                std::cerr << "Sender thread exception: "
+                          << exc.what()
+                          << "\n";
+            }
+        }
+    }
+
+    HttpClient client_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::queue<std::vector<AssetEvent>> queue_;
+    bool stopping_ = false;
+    int sent_events_ = 0;
+    int failed_events_ = 0;
+    std::thread worker_;
+};
+
+
 CollectorStats processPackets(
     pcap_t* handle,
     const std::string& sourceName,
@@ -152,7 +262,7 @@ CollectorStats processPackets(
     parsers.push_back(std::make_unique<DhcpParser>());
     parsers.push_back(std::make_unique<SsdpParser>());
 
-    HttpClient client(url);
+    AsyncBatchSender sender(url);
 
     CollectorStats stats;
     std::vector<AssetEvent> batch;
@@ -174,23 +284,13 @@ CollectorStats processPackets(
             return;
         }
 
-        try {
-            size_t eventCount = batch.size();
-            bool ok = client.postEvents(batch);
-
-            if (ok) {
-                stats.sent_events += static_cast<int>(eventCount);
-                std::cout << "Flushed batch with " << eventCount << " asset event(s)\n";
-            } else {
-                stats.failed_sends += static_cast<int>(eventCount);
-                std::cerr << "Failed to post batch with " << eventCount << " asset event(s)\n";
-            }
-        } catch (const std::exception& exc) {
-            stats.failed_sends += static_cast<int>(batch.size());
-            std::cerr << "Failed to post asset event batch: " << exc.what() << "\n";
-        }
-
+        size_t eventCount = batch.size();
+        sender.enqueue(std::move(batch));
         batch.clear();
+
+        std::cout << "Queued batch with "
+                  << eventCount
+                  << " asset event(s)\n";
     };
 
     while (running) {
@@ -261,6 +361,11 @@ CollectorStats processPackets(
     }
 
     flushBatch();
+
+    sender.stop();
+
+    stats.sent_events += sender.sentEvents();
+    stats.failed_sends += sender.failedEvents();
 
     return stats;
 }

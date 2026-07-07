@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
 
 add_executable(asset_collector
     src/main.cpp
@@ -20,4 +21,5 @@ target_include_directories(asset_collector PRIVATE include)
 target_link_libraries(asset_collector
     pcap
     CURL::libcurl
+    Threads::Threads
 )
