@@ -64,3 +64,19 @@ CREATE TABLE IF NOT EXISTS mac_vendor_cache
 )
 ENGINE = ReplacingMergeTree(last_checked)
 ORDER BY prefix;
+
+
+CREATE TABLE IF NOT EXISTS known_assets
+(
+    mac String,
+    label String,
+    owner String,
+    expected_ip String,
+    device_type String,
+    notes String,
+    created_at DateTime,
+    updated_at DateTime
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY mac;
+

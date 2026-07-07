@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, Query
+from pydantic import BaseModel
 
 from app.db import ch_insert_json, ch_query
 from app.models import AssetEvent
@@ -20,6 +21,16 @@ metrics = {
     "asset_events_ingested": 0,
     "ingest_errors": 0,
 }
+
+
+class KnownAssetInput(BaseModel):
+    mac: str
+    label: str = ""
+    owner: str = ""
+    expected_ip: str = ""
+    device_type: str = ""
+    notes: str = ""
+
 
 OUI_VENDOR_MAP = {
     # Add known MAC OUI prefixes here when available.
@@ -92,6 +103,93 @@ def get_asset_status(last_seen: str) -> str:
     except Exception:
         return "unknown"
 
+
+
+@app.get("/api/v1/known-assets")
+def list_known_assets():
+    return {
+        "total": len(known_asset_rows()),
+        "items": known_asset_rows(),
+    }
+
+
+@app.post("/api/v1/known-assets")
+def add_known_asset(asset: KnownAssetInput):
+    mac = normalize_full_mac(asset.mac)
+
+    if not mac or len(mac) < 12:
+        return {
+            "status": "error",
+            "message": "Invalid MAC address",
+        }
+
+    row = {
+        "mac": mac,
+        "label": asset.label,
+        "owner": asset.owner,
+        "expected_ip": asset.expected_ip,
+        "device_type": asset.device_type,
+        "notes": asset.notes,
+        "created_at": now_string(),
+        "updated_at": now_string(),
+    }
+
+    ch_insert_json("known_assets", [row])
+
+    return {
+        "status": "ok",
+        "item": row,
+    }
+
+
+@app.get("/api/v1/policy/assets")
+def list_assets_with_policy(limit: int = Query(100, ge=1, le=1000)):
+    query = f"""
+    SELECT
+        asset_id,
+        ip,
+        mac,
+        hostname,
+        vendor,
+        device_type,
+        model_hint,
+        os_hint,
+        service_hints,
+        sources,
+        first_seen,
+        last_seen,
+        last_source
+    FROM assets_latest FINAL
+    ORDER BY last_seen DESC
+    LIMIT {limit}
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    assets = [json.loads(line) for line in result.strip().splitlines() if line]
+
+    known_map = {
+        normalize_full_mac(row.get("mac", "")): row
+        for row in known_asset_rows()
+    }
+
+    for asset in assets:
+        mac = normalize_full_mac(asset.get("mac") or asset.get("asset_id"))
+        known = known_map.get(mac)
+
+        asset["is_known"] = known is not None
+        asset["policy_status"] = "allowed" if known else "unknown"
+        asset["recommended_action"] = "allow" if known else "restrict"
+        asset["known_label"] = known.get("label", "") if known else ""
+        asset["owner"] = known.get("owner", "") if known else ""
+        asset["expected_ip"] = known.get("expected_ip", "") if known else ""
+        asset["status"] = get_asset_status(asset.get("last_seen", ""))
+
+    return {
+        "total": len(assets),
+        "items": assets,
+    }
+
 @app.get("/health")
 def health():
     try:
@@ -123,6 +221,7 @@ def ingest_asset_events(events: List[AssetEvent]):
 
     try:
         ch_insert_json("asset_events", rows)
+        insert_unknown_asset_alerts(events)
         upsert_assets(events)
         metrics["asset_events_ingested"] += len(events)
 
@@ -277,6 +376,145 @@ def asset_resurfaced_alert(
         "message": f"Asset resurfaced after {hours:.1f} hour(s): {label} / {mac}",
         "created_at": now_string(),
     }
+
+
+
+def normalize_full_mac(mac: str) -> str:
+    hex_chars = "".join(ch for ch in str(mac).lower() if ch in "0123456789abcdef")
+
+    if len(hex_chars) < 12:
+        return str(mac).strip().lower().replace("-", ":")
+
+    return ":".join(hex_chars[i:i + 2] for i in range(0, 12, 2))
+
+
+def known_asset_rows() -> List[dict]:
+    query = """
+    SELECT
+        mac,
+        label,
+        owner,
+        expected_ip,
+        device_type,
+        notes,
+        created_at,
+        updated_at
+    FROM known_assets FINAL
+    ORDER BY updated_at DESC
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    return [json.loads(line) for line in result.strip().splitlines() if line]
+
+
+def get_known_asset(mac: str) -> Optional[dict]:
+    normalized_mac = normalize_full_mac(mac)
+
+    if not normalized_mac:
+        return None
+
+    safe_mac = sql_escape(normalized_mac)
+
+    query = f"""
+    SELECT
+        mac,
+        label,
+        owner,
+        expected_ip,
+        device_type,
+        notes,
+        created_at,
+        updated_at
+    FROM known_assets FINAL
+    WHERE mac = '{safe_mac}'
+    ORDER BY updated_at DESC
+    LIMIT 1
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    lines = [line for line in result.strip().splitlines() if line]
+
+    if not lines:
+        return None
+
+    return json.loads(lines[0])
+
+
+def unknown_asset_alert(asset_id: str, ip: str, mac: str, source: str) -> dict:
+    label = ip if ip else "unknown-ip"
+
+    return {
+        "alert_id": uuid.uuid4().hex[:16],
+        "alert_type": "unknown_asset",
+        "severity": "high",
+        "asset_id": asset_id,
+        "ip": ip,
+        "mac": mac,
+        "source": source,
+        "message": f"Unknown asset detected by whitelist policy: {label} / {mac}",
+        "created_at": now_string(),
+    }
+
+
+def unknown_asset_alert_exists(asset_id: str) -> bool:
+    if not asset_id:
+        return False
+
+    safe_asset_id = sql_escape(asset_id)
+
+    query = f"""
+    SELECT count() AS count
+    FROM asset_alerts
+    WHERE alert_type = 'unknown_asset'
+      AND asset_id = '{safe_asset_id}'
+    FORMAT JSONEachRow
+    """
+
+    result = ch_query(query)
+    lines = [line for line in result.strip().splitlines() if line]
+
+    if not lines:
+        return False
+
+    return int(json.loads(lines[0]).get("count", 0)) > 0
+
+
+def insert_unknown_asset_alerts(events: List[AssetEvent]):
+    alerts = []
+    queued_asset_ids = set()
+
+    for event in events:
+        mac = normalize_full_mac(event.mac or event.asset_id)
+        asset_id = event.asset_id or mac
+
+        if not mac or not asset_id:
+            continue
+
+        if asset_id in queued_asset_ids:
+            continue
+
+        if get_known_asset(mac):
+            continue
+
+        if unknown_asset_alert_exists(asset_id):
+            continue
+
+        alerts.append(
+            unknown_asset_alert(
+                asset_id=asset_id,
+                ip=event.ip,
+                mac=mac,
+                source=event.source,
+            )
+        )
+
+        queued_asset_ids.add(asset_id)
+
+    if alerts:
+        ch_insert_json("asset_alerts", alerts)
+
 
 
 
