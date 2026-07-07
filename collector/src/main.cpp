@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "ArpParser.hpp"
 #include "DhcpParser.hpp"
 #include "HttpClient.hpp"
+#include "ProtocolParser.hpp"
 
 static bool running = true;
 
@@ -141,8 +143,10 @@ CollectorStats processPackets(
     int countLimit,
     int batchSize
 ) {
-    ArpParser arpParser;
-    DhcpParser dhcpParser;
+    std::vector<std::unique_ptr<ProtocolParser>> parsers;
+    parsers.push_back(std::make_unique<ArpParser>());
+    parsers.push_back(std::make_unique<DhcpParser>());
+
     HttpClient client(url);
 
     CollectorStats stats;
@@ -193,10 +197,14 @@ CollectorStats processPackets(
 
         stats.total_packets++;
 
-        auto event = arpParser.parse(packet, header->caplen, sourceName);
+        std::optional<AssetEvent> event;
 
-        if (!event.has_value()) {
-            event = dhcpParser.parse(packet, header->caplen, sourceName);
+        for (const auto& parser : parsers) {
+            event = parser->parse(packet, header->caplen, sourceName);
+
+            if (event.has_value()) {
+                break;
+            }
         }
 
         if (!event.has_value()) {

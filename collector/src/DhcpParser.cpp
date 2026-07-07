@@ -1,5 +1,11 @@
 #include "DhcpParser.hpp"
 
+std::string DhcpParser::name() const {
+    return "dhcp";
+}
+
+#include "DhcpParser.hpp"
+
 #include <arpa/inet.h>
 
 #include <chrono>

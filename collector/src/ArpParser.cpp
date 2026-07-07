@@ -1,5 +1,11 @@
 #include "ArpParser.hpp"
 
+std::string ArpParser::name() const {
+    return "arp";
+}
+
+#include "ArpParser.hpp"
+
 #include <arpa/inet.h>
 #include <chrono>
 #include <iomanip>
