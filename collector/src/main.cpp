@@ -1,6 +1,7 @@
 #include <pcap.h>
 
 #include <csignal>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -120,6 +121,7 @@ void printUsage() {
         << "  --config <file>    Load collector settings from config file.\n"
         << "  --url <endpoint>   Default: http://localhost:8000/api/v1/ingest/asset-events\n"
         << "  --count <n>        Stop after n discovered asset events. 0 means unlimited in live mode.\n"
+        << "  --duration <sec>   Stop after this many seconds. 0 means no duration limit.\n"
         << "  --batch-size <n>   Number of asset events per HTTP request. Default: 5.\n"
         << "  --filter <value>   Default: arp or DHCP. Use 'all' to disable BPF filter.\n\n"
         << "Examples:\n"
@@ -142,7 +144,8 @@ CollectorStats processPackets(
     const std::string& sourceName,
     const std::string& url,
     int countLimit,
-    int batchSize
+    int batchSize,
+    int durationSeconds
 ) {
     std::vector<std::unique_ptr<ProtocolParser>> parsers;
     parsers.push_back(std::make_unique<ArpParser>());
@@ -153,6 +156,18 @@ CollectorStats processPackets(
 
     CollectorStats stats;
     std::vector<AssetEvent> batch;
+    auto startedAt = std::chrono::steady_clock::now();
+
+    auto durationReached = [&]() {
+        if (durationSeconds <= 0) {
+            return false;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startedAt).count();
+
+        return elapsed >= durationSeconds;
+    };
 
     auto flushBatch = [&]() {
         if (batch.empty()) {
@@ -179,6 +194,10 @@ CollectorStats processPackets(
     };
 
     while (running) {
+        if (durationReached()) {
+            break;
+        }
+
         struct pcap_pkthdr* header = nullptr;
         const u_char* packet = nullptr;
 
@@ -235,6 +254,10 @@ CollectorStats processPackets(
         if (countLimit > 0 && stats.parsed_asset_events >= countLimit) {
             break;
         }
+
+        if (durationReached()) {
+            break;
+        }
     }
 
     flushBatch();
@@ -272,8 +295,16 @@ int main(int argc, char** argv) {
         configuredBatchSize = 5;
     }
 
+    int configuredDuration = 0;
+    try {
+        configuredDuration = std::stoi(configValue(config, "duration", "0"));
+    } catch (...) {
+        configuredDuration = 0;
+    }
+
     int countLimit = getIntArg(argc, argv, "--count", configuredCount);
     int batchSize = getIntArg(argc, argv, "--batch-size", configuredBatchSize);
+    int durationSeconds = getIntArg(argc, argv, "--duration", configuredDuration);
 
     if (batchSize <= 0) {
         batchSize = 1;
@@ -371,9 +402,13 @@ int main(int argc, char** argv) {
         std::cout << "Run mode: stop after " << countLimit << " asset event(s)\n";
     }
 
+    if (durationSeconds > 0) {
+        std::cout << "Duration limit: " << durationSeconds << " second(s)\n";
+    }
+
     std::cout << "Batch size: " << batchSize << "\n";
 
-    CollectorStats stats = processPackets(handle, sourceName, url, countLimit, batchSize);
+    CollectorStats stats = processPackets(handle, sourceName, url, countLimit, batchSize, durationSeconds);
 
     if (filterInstalled) {
         pcap_freecode(&fp);
