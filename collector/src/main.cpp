@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <thread>
 #include <queue>
 #include <mutex>
@@ -127,6 +128,7 @@ void printUsage() {
         << "  --count <n>        Stop after n discovered asset events. 0 means unlimited in live mode.\n"
         << "  --duration <sec>   Stop after this many seconds. 0 means no duration limit.\n"
         << "  --batch-size <n>   Number of asset events per HTTP request. Default: 5.\n"
+        << "  --parser-workers <n> Number of parser worker threads. Default: 2.\n"
         << "  --filter <value>   Default: arp or DHCP. Use 'all' to disable BPF filter.\n\n"
         << "Examples:\n"
         << "  sudo ./asset_collector --config ../config/collector.conf --count 5\n"
@@ -255,17 +257,33 @@ CollectorStats processPackets(
     const std::string& url,
     int countLimit,
     int batchSize,
-    int durationSeconds
+    int durationSeconds,
+    int parserWorkerCount
 ) {
-    std::vector<std::unique_ptr<ProtocolParser>> parsers;
-    parsers.push_back(std::make_unique<ArpParser>());
-    parsers.push_back(std::make_unique<DhcpParser>());
-    parsers.push_back(std::make_unique<SsdpParser>());
+    struct RawPacket {
+        std::vector<uint8_t> data;
+        std::string sourceName;
+    };
+
+    if (parserWorkerCount <= 0) {
+        parserWorkerCount = 1;
+    }
 
     AsyncBatchSender sender(url);
 
-    CollectorStats stats;
+    std::atomic<int> totalPackets{0};
+    std::atomic<int> parsedEvents{0};
+    std::atomic<int> skippedPackets{0};
+
+    std::queue<RawPacket> rawQueue;
+    std::mutex rawQueueMutex;
+    std::condition_variable rawQueueCv;
+    bool captureFinished = false;
+
     std::vector<AssetEvent> batch;
+    std::mutex batchMutex;
+    std::mutex logMutex;
+
     auto startedAt = std::chrono::steady_clock::now();
 
     auto durationReached = [&]() {
@@ -279,22 +297,126 @@ CollectorStats processPackets(
         return elapsed >= durationSeconds;
     };
 
-    auto flushBatch = [&]() {
-        if (batch.empty()) {
+    auto queueBatch = [&](std::vector<AssetEvent> readyBatch) {
+        if (readyBatch.empty()) {
             return;
         }
 
-        size_t eventCount = batch.size();
-        sender.enqueue(std::move(batch));
-        batch.clear();
+        size_t eventCount = readyBatch.size();
+        sender.enqueue(std::move(readyBatch));
 
+        std::lock_guard<std::mutex> lock(logMutex);
         std::cout << "Queued batch with "
                   << eventCount
                   << " asset event(s)\n";
     };
 
+    auto enqueueParsedEvent = [&](AssetEvent event) {
+        std::vector<AssetEvent> readyBatch;
+
+        {
+            std::lock_guard<std::mutex> lock(batchMutex);
+            batch.push_back(std::move(event));
+
+            if (static_cast<int>(batch.size()) >= batchSize) {
+                readyBatch = std::move(batch);
+                batch.clear();
+            }
+        }
+
+        queueBatch(std::move(readyBatch));
+    };
+
+    auto flushRemainingBatch = [&]() {
+        std::vector<AssetEvent> readyBatch;
+
+        {
+            std::lock_guard<std::mutex> lock(batchMutex);
+
+            if (!batch.empty()) {
+                readyBatch = std::move(batch);
+                batch.clear();
+            }
+        }
+
+        queueBatch(std::move(readyBatch));
+    };
+
+    auto parserWorker = [&]() {
+        std::vector<std::unique_ptr<ProtocolParser>> parsers;
+        parsers.push_back(std::make_unique<ArpParser>());
+        parsers.push_back(std::make_unique<DhcpParser>());
+        parsers.push_back(std::make_unique<SsdpParser>());
+
+        while (true) {
+            RawPacket rawPacket;
+
+            {
+                std::unique_lock<std::mutex> lock(rawQueueMutex);
+
+                rawQueueCv.wait(lock, [&]() {
+                    return captureFinished || !rawQueue.empty();
+                });
+
+                if (rawQueue.empty() && captureFinished) {
+                    break;
+                }
+
+                rawPacket = std::move(rawQueue.front());
+                rawQueue.pop();
+            }
+
+            std::optional<AssetEvent> event;
+
+            for (const auto& parser : parsers) {
+                event = parser->parse(
+                    rawPacket.data.data(),
+                    static_cast<int>(rawPacket.data.size()),
+                    rawPacket.sourceName
+                );
+
+                if (event.has_value()) {
+                    break;
+                }
+            }
+
+            if (!event.has_value()) {
+                skippedPackets++;
+                continue;
+            }
+
+            parsedEvents++;
+
+            {
+                std::lock_guard<std::mutex> lock(logMutex);
+
+                std::cout << "Discovered asset ip=" << event->ip
+                          << " mac=" << event->mac
+                          << " source=" << event->source;
+
+                if (!event->hostname.empty()) {
+                    std::cout << " hostname=" << event->hostname;
+                }
+
+                std::cout << "\n";
+            }
+
+            enqueueParsedEvent(std::move(event.value()));
+        }
+    };
+
+    std::vector<std::thread> parserWorkers;
+
+    for (int i = 0; i < parserWorkerCount; ++i) {
+        parserWorkers.emplace_back(parserWorker);
+    }
+
     while (running) {
         if (durationReached()) {
+            break;
+        }
+
+        if (countLimit > 0 && parsedEvents.load() >= countLimit) {
             break;
         }
 
@@ -316,56 +438,42 @@ CollectorStats processPackets(
             break;
         }
 
-        stats.total_packets++;
+        RawPacket rawPacket;
+        rawPacket.sourceName = sourceName;
+        rawPacket.data.assign(packet, packet + header->caplen);
 
-        std::optional<AssetEvent> event;
-
-        for (const auto& parser : parsers) {
-            event = parser->parse(packet, header->caplen, sourceName);
-
-            if (event.has_value()) {
-                break;
-            }
+        {
+            std::lock_guard<std::mutex> lock(rawQueueMutex);
+            rawQueue.push(std::move(rawPacket));
         }
 
-        if (!event.has_value()) {
-            stats.skipped_packets++;
-            continue;
-        }
+        rawQueueCv.notify_one();
+        totalPackets++;
+    }
 
-        stats.parsed_asset_events++;
+    {
+        std::lock_guard<std::mutex> lock(rawQueueMutex);
+        captureFinished = true;
+    }
 
-        std::cout << "Discovered asset ip=" << event->ip
-                  << " mac=" << event->mac
-                  << " source=" << event->source;
+    rawQueueCv.notify_all();
 
-        if (!event->hostname.empty()) {
-            std::cout << " hostname=" << event->hostname;
-        }
-
-        std::cout << "\n";
-
-        batch.push_back(event.value());
-
-        if (static_cast<int>(batch.size()) >= batchSize) {
-            flushBatch();
-        }
-
-        if (countLimit > 0 && stats.parsed_asset_events >= countLimit) {
-            break;
-        }
-
-        if (durationReached()) {
-            break;
+    for (auto& worker : parserWorkers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
-    flushBatch();
+    flushRemainingBatch();
 
     sender.stop();
 
-    stats.sent_events += sender.sentEvents();
-    stats.failed_sends += sender.failedEvents();
+    CollectorStats stats;
+    stats.total_packets = totalPackets.load();
+    stats.parsed_asset_events = parsedEvents.load();
+    stats.skipped_packets = skippedPackets.load();
+    stats.sent_events = sender.sentEvents();
+    stats.failed_sends = sender.failedEvents();
 
     return stats;
 }
@@ -407,12 +515,24 @@ int main(int argc, char** argv) {
         configuredDuration = 0;
     }
 
+    int configuredParserWorkers = 2;
+    try {
+        configuredParserWorkers = std::stoi(configValue(config, "parser_workers", "2"));
+    } catch (...) {
+        configuredParserWorkers = 2;
+    }
+
     int countLimit = getIntArg(argc, argv, "--count", configuredCount);
     int batchSize = getIntArg(argc, argv, "--batch-size", configuredBatchSize);
     int durationSeconds = getIntArg(argc, argv, "--duration", configuredDuration);
+    int parserWorkerCount = getIntArg(argc, argv, "--parser-workers", configuredParserWorkers);
 
     if (batchSize <= 0) {
         batchSize = 1;
+    }
+
+    if (parserWorkerCount <= 0) {
+        parserWorkerCount = 1;
     }
 
     std::signal(SIGINT, handleSignal);
@@ -512,8 +632,17 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Batch size: " << batchSize << "\n";
+    std::cout << "Parser workers: " << parserWorkerCount << "\n";
 
-    CollectorStats stats = processPackets(handle, sourceName, url, countLimit, batchSize, durationSeconds);
+    CollectorStats stats = processPackets(
+        handle,
+        sourceName,
+        url,
+        countLimit,
+        batchSize,
+        durationSeconds,
+        parserWorkerCount
+    );
 
     if (filterInstalled) {
         pcap_freecode(&fp);
