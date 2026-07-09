@@ -1,113 +1,155 @@
 # Passive Network Asset Discovery System
 
-A passive network asset discovery system that observes network traffic and identifies active assets in a local network.
+## Overview
 
-The current MVP uses a C++ collector with libpcap to capture real ARP packets from a network interface. It extracts IP/MAC information, sends asset events to a FastAPI backend, stores data in ClickHouse, and exposes query APIs for discovered assets.
+Passive Network Asset Discovery System is a mini-project for discovering and monitoring network assets in a LAN using a passive approach.
 
-## Features
+Instead of actively scanning the network, the system listens to existing LAN traffic such as ARP, DHCP and SSDP/UPnP. The collector extracts asset metadata, sends normalized asset events to the backend, stores them in ClickHouse, applies known/unknown asset policy, raises alerts, and displays the current network inventory through a dashboard.
 
-- Live ARP packet capture using C++ and libpcap
-- Offline PCAP replay mode for stable demo
-- FastAPI backend for asset event ingestion
-- ClickHouse storage for raw asset events and latest asset state
-- Query APIs for assets, raw asset events, and summary statistics
-- Docker Compose deployment for backend services
+## Main Features
 
-## Architecture
+- Passive asset discovery from existing LAN traffic.
+- C++ collector using libpcap.
+- Multi-protocol parsing:
+  - ARP
+  - DHCP
+  - SSDP/UPnP
+- Realtime multi-threaded collector pipeline:
+  - Capture thread
+  - Raw packet queue
+  - Parser worker pool
+  - Batch queue
+  - Sender thread
+- FastAPI backend for event ingestion and query APIs.
+- ClickHouse storage for event logs and latest asset state.
+- MAC/OUI vendor lookup with cache.
+- Alert system:
+  - new_asset
+  - ip_changed
+  - asset_resurfaced
+  - unknown_asset
+- Known/Unknown Asset Policy using whitelist.
+- Streamlit dashboard for monitoring asset inventory, alerts and whitelist.
 
-~~~text
-C++ libpcap Collector
+## System Architecture
+
+```text
+Network Traffic
+ARP / DHCP / SSDP
         |
-        | HTTP POST asset events
         v
-FastAPI Ingest API
+C++ Collector
+libpcap live capture
         |
         v
-ClickHouse
+Protocol Parsers
+ARP / DHCP / SSDP
         |
         v
-Asset Query API
-~~~
+FastAPI Backend
+Ingest + Policy + Alerts
+        |
+        v
+ClickHouse Storage
+asset_events / assets_latest / asset_alerts / known_assets
+        |
+        v
+Streamlit Dashboard
+Asset inventory / Alerts / Known-Unknown Policy
+```
+
+## Collector Pipeline
+
+```text
+Main / Capture Thread
+libpcap pcap_next_ex()
+        |
+        v
+Raw Packet Queue
+thread-safe queue
+        |
+        v
+Parser Worker Pool
+ARP / DHCP / SSDP
+        |
+        v
+Batch Queue
+AssetEvent batches
+        |
+        v
+Sender Thread
+HTTP POST batches
+        |
+        v
+FastAPI API
+```
 
 ## Project Structure
 
-~~~text
-passive-asset-discovery/
+```text
+Passive-Network-Asset-Discovery-System/
 ├── api/
-│   └── app/
-│       ├── main.py
-│       ├── db.py
-│       └── models.py
 ├── clickhouse/
-│   └── init.sql
 ├── collector/
-│   ├── include/
-│   └── src/
+├── config/
+├── dashboard/
 ├── docs/
-├── samples/
-│   └── arp-demo.pcap
-└── docker-compose.yml
-~~~
+├── scripts/
+├── docker-compose.yml
+├── docker-compose.dashboard.yml
+└── README.md
+```
 
-## Build and Run
+## Requirements
 
-Start backend services:
+Install dependencies:
 
-~~~bash
-sudo docker compose up -d --build
-~~~
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake libpcap-dev libcurl4-openssl-dev nlohmann-json3-dev jq netcat-openbsd
+```
 
-Check health:
+## Start Backend and Dashboard
 
-~~~bash
-curl http://localhost:8000/health
-~~~
+```bash
+sudo docker compose -f docker-compose.yml -f docker-compose.dashboard.yml up -d --build
+```
 
-Build C++ collector:
+Check backend:
 
-~~~bash
+```bash
+curl -s http://localhost:8000/health | jq
+```
+
+Open dashboard:
+
+```text
+http://localhost:8501
+```
+
+## Build Collector
+
+```bash
 cd collector
 cmake -S . -B build
 cmake --build build
-~~~
+```
 
-Run live capture mode:
+## Run Collector in Realtime Mode
 
-~~~bash
-sudo ./build/asset_collector --mode live --iface wlp3s0 --count 5
-~~~
+```bash
+cd collector
 
-Run offline PCAP mode:
+sudo ./build/asset_collector \
+  --config ../config/collector.conf \
+  --count 0 \
+  --duration 0 \
+  --batch-size 5 \
+  --parser-workers 2
+```
 
-~~~bash
-./build/asset_collector --mode pcap --file ../samples/arp-demo.pcap
-~~~
+Stop collector with:
 
-Query discovered assets:
-
-~~~bash
-curl http://localhost:8000/api/v1/assets | jq
-curl http://localhost:8000/api/v1/asset-events | jq
-curl http://localhost:8000/api/v1/assets/summary | jq
-~~~
-
-## Current Demo Result
-
-The system successfully discovered a real LAN asset from ARP traffic:
-
-~~~json
-{
-  "asset_id": "30:de:4b:18:f4:50",
-  "ip": "192.168.12.67",
-  "mac": "30:de:4b:18:f4:50",
-  "sources": ["arp"],
-  "last_source": "arp"
-}
-~~~
-
-## Current Limitations
-
-- Only ARP packet parsing is implemented in the current MVP.
-- DHCP parsing is planned but not implemented yet.
-- Vendor lookup from MAC OUI is not implemented yet.
-- Live capture depends on the amount of ARP traffic visible on the selected interface.
+```text
+Ctrl + C
+```
