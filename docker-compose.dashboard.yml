@@ -1,0 +1,11 @@
+services:
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: asset-dashboard
+    environment:
+      API_BASE_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
